@@ -594,12 +594,22 @@ def main():
     parser = argparse.ArgumentParser(
         description='Convert Confluence export to Obsidian Markdown (auto-detects HTML export or XML backup)'
     )
-    parser.add_argument('source', help='Path to Confluence export (.zip file or extracted directory)')
-    parser.add_argument('dest', help='Destination directory for Obsidian Markdown files')
+    parser.add_argument('source', nargs='?', help='Path to Confluence export (.zip file or extracted directory)')
+    parser.add_argument('dest', nargs='?', help='Destination directory for Obsidian Markdown files')
     args = parser.parse_args()
 
-    source = Path(args.source).resolve()
-    dest_dir = Path(args.dest).resolve()
+    # Interactive prompts if args not provided
+    if args.source:
+        source = Path(args.source).resolve()
+    else:
+        src_input = input("Path to Confluence export (.zip or extracted folder): ").strip().strip('"')
+        source = Path(src_input).resolve()
+
+    if args.dest:
+        dest_dir = Path(args.dest).resolve()
+    else:
+        dest_input = input("Destination folder name (will be created): ").strip().strip('"')
+        dest_dir = Path(dest_input).resolve()
 
     print("\n============================================")
     print(" Confluence to Obsidian Converter")
