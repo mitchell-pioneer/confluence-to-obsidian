@@ -49,11 +49,6 @@ Example:
 python convert.py ./EI ~/MyVault/confluence-import
 ```
 
-## Obsidian Tips
+## Recommended Obsidian Plugins
 
-Add this CSS snippet (Settings > Appearance > CSS Snippets) to prevent code block line wrapping (match Confluence behavior):
-
-```css
-.markdown-rendered pre code { white-space: pre; overflow-wrap: normal; }
-.markdown-rendered pre { overflow-x: auto; }
-```
+- **Code Styler** - Adds line numbers, syntax highlighting themes, and no-wrap scrolling to code blocks, matching the Confluence code block appearance. Install from Settings > Community Plugins > Browse > search "Code Styler".
