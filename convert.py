@@ -389,7 +389,18 @@ def main():
         subprocess.run(['pandoc', '--version'], capture_output=True, check=True)
         print("[OK] Pandoc found")
     except Exception:
-        print("ERROR: Pandoc not found. Install from https://pandoc.org/installing.html")
+        print("ERROR: Pandoc is not installed or not in PATH.")
+        print()
+        if sys.platform == 'win32':
+            answer = input("Install pandoc via chocolatey? (y/n): ").strip().lower()
+            if answer == 'y':
+                print("Installing pandoc...")
+                subprocess.run(['choco', 'install', 'pandoc', '-y'], check=True)
+                print("[OK] Pandoc installed. You may need to restart your terminal.")
+            else:
+                print("Please install pandoc: https://pandoc.org/installing.html")
+        else:
+            print("Install with: sudo apt install pandoc  (or brew install pandoc)")
         return
 
     if not source_dir.exists():
