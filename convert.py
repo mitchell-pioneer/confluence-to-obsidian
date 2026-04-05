@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 try:
@@ -355,6 +356,203 @@ def clean_markdown(md: str) -> str:
     return md.strip()
 
 
+##############################################################################
+# XML Backup Support
+##############################################################################
+
+def _rx(pattern, text):
+    m = re.search(pattern, text, re.DOTALL)
+    return m.group(1) if m else None
+
+
+def _rx_cdata(pattern, text):
+    m = re.search(pattern, text, re.DOTALL)
+    return m.group(1) if m else None
+
+
+def parse_xml_backup(xml_data: str):
+    """Parse entities.xml from a Confluence XML backup."""
+    pages, bodies, spaces, attachments = {}, {}, {}, {}
+
+    for m in re.finditer(r'<object class="Page" package="com\.atlassian\.confluence\.pages">(.*?)</object>', xml_data, re.DOTALL):
+        b = m.group(1)
+        pid = _rx(r'<id name="id">(\d+)</id>', b)
+        title = _rx_cdata(r'<property name="title"><!\[CDATA\[(.*?)\]\]>', b)
+        parent = _rx(r'<property name="parent" class="Page"[^>]*>.*?<id name="id">(\d+)</id>', b)
+        space = _rx(r'<property name="space" class="Space"[^>]*>.*?<id name="id">(\d+)</id>', b)
+        status = _rx_cdata(r'<property name="contentStatus"><!\[CDATA\[(.*?)\]\]>', b)
+        if pid and title and status == 'current':
+            pages[pid] = {'title': title, 'parent_id': parent, 'space_id': space}
+
+    for m in re.finditer(r'<object class="BodyContent" package="com\.atlassian\.confluence\.core">(.*?)</object>', xml_data, re.DOTALL):
+        b = m.group(1)
+        page_id = _rx(r'<property name="content" class="Page"[^>]*>.*?<id name="id">(\d+)</id>', b)
+        body = _rx_cdata(r'<property name="body"><!\[CDATA\[(.*?)\]\]>', b)
+        body_type = _rx(r'<property name="bodyType">(\d+)</property>', b)
+        if page_id and body and body_type != '0':
+            if page_id not in bodies or len(body) > len(bodies.get(page_id, '')):
+                bodies[page_id] = body
+
+    for m in re.finditer(r'<object class="Space" package="com\.atlassian\.confluence\.spaces">(.*?)</object>', xml_data, re.DOTALL):
+        b = m.group(1)
+        sid = _rx(r'<id name="id">(\d+)</id>', b)
+        key = _rx_cdata(r'<property name="key"><!\[CDATA\[(.*?)\]\]>', b)
+        name = _rx_cdata(r'<property name="name"><!\[CDATA\[(.*?)\]\]>', b)
+        if sid:
+            spaces[sid] = {'key': key or '', 'name': name or key or ''}
+
+    for m in re.finditer(r'<object class="Attachment" package="com\.atlassian\.confluence\.pages">(.*?)</object>', xml_data, re.DOTALL):
+        b = m.group(1)
+        aid = _rx(r'<id name="id">(\d+)</id>', b)
+        title = _rx_cdata(r'<property name="title"><!\[CDATA\[(.*?)\]\]>', b)
+        container = _rx(r'<property name="containerContent" class="Page"[^>]*>.*?<id name="id">(\d+)</id>', b)
+        version = _rx(r'<property name="version">(\d+)</property>', b)
+        if aid and title:
+            attachments[aid] = {'title': title, 'container_id': container, 'version': version or '1'}
+
+    return pages, bodies, spaces, attachments
+
+
+def build_xml_page_path(page_id, pages):
+    """Build folder path from parent chain in XML backup."""
+    parts = []
+    seen = set()
+    current = pages.get(page_id, {}).get('parent_id')
+    while current and current in pages and current not in seen:
+        seen.add(current)
+        parts.append(sanitize_filename(pages[current]['title']))
+        current = pages[current].get('parent_id')
+    parts.reverse()
+    return os.path.join(*parts) if parts else ''
+
+
+def convert_xml_backup(zip_path: Path, dest_dir: Path):
+    """Convert a Confluence XML backup zip to Obsidian markdown."""
+    print(f"Detected: XML backup format")
+    print(f"Reading {zip_path.name} ...")
+
+    z = zipfile.ZipFile(zip_path)
+    with z.open('entities.xml') as f:
+        xml_data = f.read().decode('utf-8', errors='replace')
+    print(f"[OK] Loaded entities.xml ({len(xml_data) // 1024 // 1024} MB)")
+
+    print("Parsing pages, bodies, spaces, attachments...")
+    pages, bodies, spaces, attachments = parse_xml_backup(xml_data)
+    print(f"[OK] {len(pages)} pages, {len(bodies)} body contents, {len(spaces)} spaces, {len(attachments)} attachments\n")
+
+    # Extract attachments
+    print("Extracting attachments...")
+    att_count = 0
+    zip_names = set(z.namelist())
+    for aid, att_info in attachments.items():
+        container_id = att_info['container_id']
+        version = att_info['version']
+        zip_entry = f"attachments/{container_id}/{aid}/{version}"
+        if zip_entry in zip_names:
+            try:
+                dest_att_dir = dest_dir / 'attachments' / str(container_id)
+                dest_att_dir.mkdir(parents=True, exist_ok=True)
+                dest_file = dest_att_dir / sanitize_filename(att_info['title'])
+                with z.open(zip_entry) as src, open(dest_file, 'wb') as dst:
+                    dst.write(src.read())
+                att_count += 1
+            except Exception:
+                pass
+    print(f"[OK] Extracted {att_count} attachments\n")
+
+    # Convert pages
+    print("Converting pages to Markdown...\n")
+    converted = 0
+    skipped = 0
+    errors = []
+    used_names = set()
+    sorted_pages = sorted(pages.items(), key=lambda x: x[1]['title'])
+    total = len(sorted_pages)
+
+    for i, (pid, info) in enumerate(sorted_pages, 1):
+        try:
+            title = info['title']
+            body_html = bodies.get(pid, '')
+
+            if not body_html or len(body_html.strip()) < 10:
+                skipped += 1
+                continue
+
+            wrapped = f'<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>{body_html}</body></html>'
+            md = convert_html_to_markdown(wrapped)
+            if not md.strip():
+                skipped += 1
+                continue
+
+            md = clean_markdown(md)
+
+            # Fix attachment references from Confluence storage format
+            md = re.sub(
+                r'!\[([^\]]*)\]\(/download/attachments/(\d+)/([^)]+)\)',
+                lambda m: f'![[attachments/{m.group(2)}/{sanitize_filename(m.group(3))}]]',
+                md
+            )
+            md = re.sub(
+                r'\[([^\]]+)\]\(/download/attachments/(\d+)/([^)]+)\)',
+                lambda m: f'[{m.group(1)}](attachments/{m.group(2)}/{sanitize_filename(m.group(3))})',
+                md
+            )
+
+            # Build folder path
+            folder_path = build_xml_page_path(pid, pages)
+            space_id = info.get('space_id')
+            if space_id and space_id in spaces:
+                space_name = sanitize_filename(spaces[space_id]['name'])
+                folder_path = os.path.join(space_name, folder_path) if folder_path else space_name
+
+            out_dir = (dest_dir / folder_path) if folder_path else dest_dir
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            safe_name = sanitize_filename(title)
+            full_key = f"{folder_path}/{safe_name}".lower()
+            base_name = safe_name
+            counter = 2
+            while full_key in used_names:
+                safe_name = f"{base_name}_{counter}"
+                full_key = f"{folder_path}/{safe_name}".lower()
+                counter += 1
+            used_names.add(full_key)
+
+            depth = len(Path(folder_path).parts) if folder_path else 0
+            if depth > 0:
+                prefix = '/'.join(['..'] * depth)
+                md = md.replace('![[attachments/', f'![[{prefix}/attachments/')
+                md = re.sub(r'\[([^\]]*)\]\(attachments/', rf'[\1]({prefix}/attachments/', md)
+
+            out_file = out_dir / f"{safe_name}.md"
+            with open(out_file, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(md)
+
+            converted += 1
+            if i % 50 == 0 or i == total:
+                print(f"  [{i}/{total}] {converted} converted...")
+
+        except Exception as e:
+            errors.append((info.get('title', '?'), str(e)))
+
+    print(f"\n============================================")
+    print(f" Conversion Complete")
+    print(f"============================================\n")
+    print(f"  Total:     {len(pages)}")
+    print(f"  Converted: {converted}")
+    print(f"  Skipped:   {skipped}")
+    print(f"  Errors:    {len(errors)}")
+    print(f"\n  Output: {dest_dir}\n")
+    if errors:
+        print("Errors:")
+        for name, err in errors[:20]:
+            print(f"  - {name}: {err}")
+
+
+##############################################################################
+# HTML Export Support
+##############################################################################
+
 def build_title_map(source_dir: Path) -> dict:
     title_map = {}
     for html_file in source_dir.glob('*.html'):
@@ -370,15 +568,37 @@ def build_title_map(source_dir: Path) -> dict:
     return title_map
 
 
+def detect_format(source: Path) -> str:
+    """Detect whether source is an XML backup zip or HTML export directory."""
+    if source.is_file() and source.suffix == '.zip':
+        try:
+            z = zipfile.ZipFile(source)
+            if 'entities.xml' in z.namelist():
+                return 'xml_backup'
+            # HTML export zip
+            html_files = [n for n in z.namelist() if n.endswith('.html')]
+            if html_files:
+                return 'html_zip'
+        except zipfile.BadZipFile:
+            pass
+    elif source.is_dir():
+        if (source / 'entities.xml').exists():
+            return 'xml_backup_dir'
+        html_files = list(source.glob('*.html'))
+        if html_files:
+            return 'html_dir'
+    return 'unknown'
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert Confluence HTML export to Obsidian Markdown'
+        description='Convert Confluence export to Obsidian Markdown (auto-detects HTML export or XML backup)'
     )
-    parser.add_argument('source', help='Path to extracted Confluence HTML export directory')
+    parser.add_argument('source', help='Path to Confluence export (.zip file or extracted directory)')
     parser.add_argument('dest', help='Destination directory for Obsidian Markdown files')
     args = parser.parse_args()
 
-    source_dir = Path(args.source).resolve()
+    source = Path(args.source).resolve()
     dest_dir = Path(args.dest).resolve()
 
     print("\n============================================")
@@ -403,16 +623,52 @@ def main():
             print("Install with: sudo apt install pandoc  (or brew install pandoc)")
         return
 
-    if not source_dir.exists():
-        print(f"ERROR: Source not found: {source_dir}")
+    if not source.exists():
+        print(f"ERROR: Source not found: {source}")
         return
+
+    fmt = detect_format(source)
+    print(f"[OK] Source: {source}")
+    print(f"[OK] Destination: {dest_dir}")
 
     if dest_dir.exists():
         print("Cleaning previous conversion...")
         shutil.rmtree(dest_dir, ignore_errors=True)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[OK] Source: {source_dir}")
-    print(f"[OK] Destination: {dest_dir}")
+
+    # XML backup (zip or extracted)
+    if fmt == 'xml_backup':
+        convert_xml_backup(source, dest_dir)
+        return
+    elif fmt == 'xml_backup_dir':
+        # Re-pack not needed, just read entities.xml directly
+        # For simplicity, expect the zip
+        print("ERROR: Please provide the original .zip file for XML backups.")
+        return
+    elif fmt == 'html_zip':
+        # Extract to temp dir and process
+        import tempfile
+        print("Extracting HTML export zip...")
+        extract_dir = Path(tempfile.mkdtemp())
+        z = zipfile.ZipFile(source)
+        z.extractall(extract_dir)
+        # Find the directory with HTML files
+        html_files = list(extract_dir.rglob('*.html'))
+        if html_files:
+            # Find common parent
+            source_dir = html_files[0].parent
+            for hf in html_files:
+                while not hf.is_relative_to(source_dir):
+                    source_dir = source_dir.parent
+        else:
+            print("ERROR: No HTML files found in zip")
+            return
+    elif fmt == 'html_dir':
+        source_dir = source
+    else:
+        print(f"ERROR: Could not detect Confluence export format in: {source}")
+        print("  Expected: .zip file (HTML or XML backup) or directory with .html files")
+        return
 
     html_files = list(source_dir.glob('*.html'))
     print(f"\nFound {len(html_files)} HTML files to convert.\n")
